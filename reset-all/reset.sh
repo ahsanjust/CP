@@ -28,6 +28,9 @@
 #   Flags:
 #     -y, --yes        skip confirmation prompt (needed for non-interactive use)
 #     --no-backup      do NOT keep a backup (faster, destructive — not recommended)
+#     --all-users      reset EVERY human user on this PC (UID>=1000, home under
+#                      /home). Default resets only the invoking user. Lab PCs with
+#                      several student accounts want this. Requires sudo.
 #     --dry-run        print what WOULD be done, change nothing
 #     -h, --help       show help
 #
@@ -54,21 +57,25 @@ die()  { printf '\n\033[1;31m[FAIL]\033[0m %s\n' "$*" >&2; exit 1; }
 ASSUME_YES=0
 NO_BACKUP=0
 DRY_RUN=0
+ALL_USERS=0
 
 usage() {
   sed -n '2,/^$/p' "$0" | sed 's/^# \?//'
-  echo "Usage: bash reset.sh [-y|--yes] [--no-backup] [--dry-run]"
+  echo "Usage: bash reset.sh [-y|--yes] [--no-backup] [--all-users] [--dry-run]"
 }
 
 for arg in "$@"; do
   case "$arg" in
     -y|--yes)       ASSUME_YES=1 ;;
     --no-backup)    NO_BACKUP=1 ;;
+    --all-users)    ALL_USERS=1 ;;
     --dry-run)      DRY_RUN=1 ;;
     -h|--help)      usage; exit 0 ;;
     *) die "Unknown flag: $arg  (try --help)" ;;
   esac
 done
+
+BACKUP_TS="$(date +%Y%m%d-%H%M%S)"  # one timestamp so all users' backups match
 
 # ---------- sudo / privilege ----------
 if [[ "$(id -u)" -eq 0 ]]; then SUDO=""; else SUDO="sudo"; fi
@@ -93,50 +100,83 @@ run_root() {  # run with sudo if needed (honours --dry-run)
 command -v apt-get >/dev/null 2>&1 || die "Ubuntu/Debian only (apt-get not found)."
 [[ -f /etc/debian_version ]] || warn "/etc/debian_version missing — continuing, apt-get was found."
 
-# ---------- resolve REAL user home (sudo-safe) ----------
-TARGET_USER="${SUDO_USER:-$(whoami)}"
-# shellcheck disable=SC2086
-TARGET_HOME="$(eval echo ~$TARGET_USER)"
-[[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "Cannot resolve home for user '$TARGET_USER'."
-echo "Target user: $TARGET_USER"
-echo "Target home: $TARGET_HOME"
-if [[ "$(id -u)" -eq 0 && -z "${SUDO_USER:-}" ]]; then
+# ---------- resolve target user(s) ----------
+# Default: the REAL invoking user even when run with sudo (uses SUDO_USER).
+# --all-users: every human account (UID>=1000 with a home under /home).
+set_target() {  # set_target USER HOME — (re)builds all per-user globals
+  TARGET_USER="$1"
+  TARGET_HOME="$2"
+  [[ -n "$TARGET_HOME" && -d "$TARGET_HOME" ]] || die "Cannot resolve home for user '$TARGET_USER'."
+  BACKUP_DIR="$TARGET_HOME/cp-ide-backup-$BACKUP_TS"
+  VSCODE_DIRS=(
+    "$TARGET_HOME/.config/Code"
+    "$TARGET_HOME/.vscode"
+    "$TARGET_HOME/.cache/vscode-ripgrep"  # rg binary cache — safe, re-fetched on demand
+    "$TARGET_HOME/snap/code"              # snap variant (if ever used)
+  )
+  SUBLIME_DIRS=(
+    "$TARGET_HOME/.config/sublime-text"
+    "$TARGET_HOME/.config/sublime-text-3"  # ST4 keeps using this path on upgraded boxes
+    "$TARGET_HOME/.cache/sublime-text"
+    "$TARGET_HOME/.cache/sublime-text-3"   # found live on real systems — must wipe
+  )
+  CODEBLOCKS_DIRS=(
+    "$TARGET_HOME/.config/codeblocks"
+    "$TARGET_HOME/.codeblocks"
+    "$TARGET_HOME/.local/share/codeblocks"
+  )
+  ALL_CONFIG_DIRS=("${VSCODE_DIRS[@]}" "${SUBLIME_DIRS[@]}" "${CODEBLOCKS_DIRS[@]}")
+}
+
+USER_LIST=()
+if [[ "$ALL_USERS" -eq 1 ]]; then
+  while IFS=: read -r u _ uid _ _ home _; do
+    if [[ "$uid" -ge 1000 && "$home" == /home/* && -d "$home" ]]; then
+      USER_LIST+=("$u:$home")
+    fi
+  done < <(getent passwd)
+  # Fallback: getent empty (e.g. LDAP hiccup) — scan /home directly.
+  if [[ "${#USER_LIST[@]}" -eq 0 ]]; then
+    for d in /home/*/; do
+      u="$(basename -- "$d")"
+      if id "$u" >/dev/null 2>&1 && [[ -d "$d" ]]; then
+        USER_LIST+=("$u:$d")
+      fi
+    done
+  fi
+  [[ "${#USER_LIST[@]}" -gt 0 ]] || die "--all-users found no human users under /home."
+  # Pre-flight: without write access to every home we'd die halfway — fail fast.
+  if [[ "$DRY_RUN" -eq 0 ]]; then
+    for entry in "${USER_LIST[@]}"; do
+      h="${entry#*:}"
+      [[ -w "$h" ]] || die "Cannot write $h — re-run with sudo (needed for --all-users)."
+    done
+  fi
+else
+  INVOKING_USER="${SUDO_USER:-$(whoami)}"
+  # shellcheck disable=SC2086
+  INVOKING_HOME="$(eval echo ~$INVOKING_USER)"
+  USER_LIST+=("$INVOKING_USER:$INVOKING_HOME")
+fi
+
+# Show plan using the first user's paths (identical layout for the rest).
+set_target "${USER_LIST[0]%%:*}" "${USER_LIST[0]#*:}"
+if [[ "$(id -u)" -eq 0 && -z "${SUDO_USER:-}" && "$ALL_USERS" -eq 0 ]]; then
   warn "Running as root directly — configs under /root will be reset. Prefer: sudo -u <student> bash reset.sh  OR  run as the student with sudo rights."
 fi
 
-BACKUP_DIR="$TARGET_HOME/cp-ide-backup-$(date +%Y%m%d-%H%M%S)"
-
-# ---------- config paths (factory-reset targets) ----------
-# NOTE: kept as an explicit list so nothing unrelated is ever touched.
-# IMPORTANT: the g++/gcc toolchain has NO entries here on purpose — compilers
-# have no per-user IDE-style configs to wipe; they are only (re)installed.
-VSCODE_DIRS=(
-  "$TARGET_HOME/.config/Code"
-  "$TARGET_HOME/.vscode"
-  "$TARGET_HOME/snap/code"          # snap variant (if ever used)
-)
-SUBLIME_DIRS=(
-  "$TARGET_HOME/.config/sublime-text"
-  "$TARGET_HOME/.config/sublime-text-3"
-  "$TARGET_HOME/.cache/sublime-text"
-)
-CODEBLOCKS_DIRS=(
-  "$TARGET_HOME/.config/codeblocks"
-  "$TARGET_HOME/.codeblocks"
-  "$TARGET_HOME/.local/share/codeblocks"
-)
-ALL_CONFIG_DIRS=("${VSCODE_DIRS[@]}" "${SUBLIME_DIRS[@]}" "${CODEBLOCKS_DIRS[@]}")
-
-# Unique backup names — two sources share a basename (sublime-text x2,
+# Unique backup names — several sources share a basename (sublime-text x2/x3,
 # codeblocks x2), so a plain `cp ... BACKUP/` would silently overwrite.
 backup_label() {
   case "$1" in
     "$TARGET_HOME/.config/Code")            printf 'config-Code' ;;
     "$TARGET_HOME/.vscode")                 printf 'vscode' ;;
+    "$TARGET_HOME/.cache/vscode-ripgrep")   printf 'cache-vscode-ripgrep' ;;
     "$TARGET_HOME/snap/code")               printf 'snap-code' ;;
     "$TARGET_HOME/.config/sublime-text")    printf 'config-sublime-text' ;;
     "$TARGET_HOME/.config/sublime-text-3")  printf 'config-sublime-text-3' ;;
     "$TARGET_HOME/.cache/sublime-text")     printf 'cache-sublime-text' ;;
+    "$TARGET_HOME/.cache/sublime-text-3")   printf 'cache-sublime-text-3' ;;
     "$TARGET_HOME/.config/codeblocks")      printf 'config-codeblocks' ;;
     "$TARGET_HOME/.codeblocks")             printf 'home-codeblocks' ;;
     "$TARGET_HOME/.local/share/codeblocks") printf 'local-share-codeblocks' ;;
@@ -145,12 +185,17 @@ backup_label() {
 }
 
 say "This will RESET to factory-fresh + latest:"
-echo "  • VS Code      : ${VSCODE_DIRS[*]}"
-echo "  • Sublime Text : ${SUBLIME_DIRS[*]}"
-echo "  • Code::Blocks : ${CODEBLOCKS_DIRS[*]}"
+if [[ "$ALL_USERS" -eq 1 ]]; then
+  echo "  • Users        : $(printf '%s ' "${USER_LIST[@]%%:*}")"
+else
+  echo "  • User         : $TARGET_USER  (home: $TARGET_HOME)"
+fi
+echo "  • VS Code      : ~/.config/Code ~/.vscode ~/.cache/vscode-ripgrep ~/snap/code"
+echo "  • Sublime Text : ~/.config/sublime-text ~/.config/sublime-text-3 ~/.cache/sublime-text ~/.cache/sublime-text-3"
+echo "  • Code::Blocks : ~/.config/codeblocks ~/.codeblocks ~/.local/share/codeblocks"
 echo "  • Packages     : build-essential (gcc + g++) gdb codeblocks code sublime-text"
 if [[ "$NO_BACKUP" -eq 0 ]]; then
-  echo "  • Backup       : $BACKUP_DIR"
+  echo "  • Backup       : ~/cp-ide-backup-$BACKUP_TS  (inside EACH reset user's home)"
 else
   echo "  • Backup       : SKIPPED (--no-backup — destructive!)"
 fi
@@ -170,59 +215,40 @@ fi
 # ---------- 1/6 kill running IDEs ----------
 say "1/6  Closing running IDEs (if any)"
 # pkill returns 1 when nothing matched — must not abort (set -e). Hence `|| true`.
-for p in code codeblocks sublime_text subl; do
+# --all-users: kill EVERY user's IDE processes (needs root) so a second student's
+# open Sublime can't rewrite its configs after we've wiped them.
+kill_one() {  # kill_one SIGNAL PROC — honours DRY_RUN; system-wide with --all-users
+  local sig="$1" p="$2" disp
+  disp="pkill ${sig:--TERM} -x $p"
+  # (already-root sees every user's processes, so prefix sudo only when it exists)
+  [[ "$ALL_USERS" -eq 1 && -n "$SUDO" ]] && disp="sudo $disp"
   if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '   [dry-run] pkill -x %s || true\n' "$p"
-  else
-    pkill -x "$p" 2>/dev/null || true
+    printf '   [dry-run] %s || true\n' "$disp"
+    return 0
   fi
+  if [[ "$ALL_USERS" -eq 1 ]]; then
+    if [[ -n "$sig" ]]; then run_root pkill "$sig" -x "$p" 2>/dev/null || true
+    else run_root pkill -x "$p" 2>/dev/null || true; fi
+  else
+    if [[ -n "$sig" ]]; then pkill "$sig" -x "$p" 2>/dev/null || true
+    else pkill -x "$p" 2>/dev/null || true; fi
+  fi
+}
+for p in code codeblocks sublime_text subl plugin_host-3.3 plugin_host-3.8; do
+  kill_one "" "$p"
 done
 if [[ "$DRY_RUN" -eq 0 ]]; then
   sleep 2
-  for p in code codeblocks sublime_text subl; do
-    pkill -9 -x "$p" 2>/dev/null || true
-  done
-else
-  for p in code codeblocks sublime_text subl; do
-    printf '   [dry-run] pkill -9 -x %s || true\n' "$p"
-  done
 fi
+for p in code codeblocks sublime_text subl plugin_host-3.3 plugin_host-3.8; do
+  kill_one "-9" "$p"
+done
 ok "IDEs closed"
 
-# ---------- 2/6 backup ----------
-say "2/6  Backup of existing configs"
-if [[ "$NO_BACKUP" -eq 1 ]]; then
-  warn "backup skipped by --no-backup"
-else
-  if [[ "$DRY_RUN" -eq 1 ]]; then
-    printf '   [dry-run] mkdir -p %s\n' "$BACKUP_DIR"
-    for d in "${ALL_CONFIG_DIRS[@]}"; do
-      printf '   [dry-run] cp -a %s -> %s/%s (if exists)\n' "$d" "$BACKUP_DIR" "$(backup_label "$d")"
-    done
-  else
-    mkdir -p "$BACKUP_DIR"
-    copied=0
-    for d in "${ALL_CONFIG_DIRS[@]}"; do
-      if [[ -e "$d" ]]; then
-        cp -a -- "$d" "$BACKUP_DIR/$(backup_label "$d")"
-        echo "   saved: $d -> $BACKUP_DIR/$(backup_label "$d")"
-        copied=1
-      fi
-    done
-    # mkdir/cp ran as root when invoked via sudo — hand the backup back to the real user.
-    if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
-      chown -R -- "$TARGET_USER" "$BACKUP_DIR" || warn "could not chown $BACKUP_DIR to $TARGET_USER"
-    fi
-    [[ "$copied" -eq 1 ]] && ok "backup at $BACKUP_DIR" || echo "   (no existing configs — nothing to back up)"
-  fi
-fi
-
-# ---------- 3/6 wipe to factory-fresh ----------
-say "3/6  Wiping configs to factory-fresh state"
-
-safe_rm() {  # safe_rm DIR — guarded rm -rf
+# ---------- 2/6 backup + 3/6 wipe (per user) ----------
+safe_rm() {  # safe_rm DIR — guarded rm -rf (uses current TARGET_HOME)
   local d="$1"
-  # Guards: non-empty, not /, not $HOME, must be inside TARGET_HOME or TARGET_HOME/snap.
+  # Guards: non-empty, not /, not $HOME, must be inside TARGET_HOME.
   if [[ -z "$d" || "$d" == "/" || "$d" == "$TARGET_HOME" ]]; then
     die "Refusing to remove unsafe path: '$d'"
   fi
@@ -242,10 +268,48 @@ safe_rm() {  # safe_rm DIR — guarded rm -rf
   fi
 }
 
-for d in "${ALL_CONFIG_DIRS[@]}"; do
-  safe_rm "$d"
+reset_one_user() {  # reset_one_user USER HOME — backup then wipe to factory-fresh
+  set_target "$1" "$2"
+  echo
+  echo "--- user: $TARGET_USER  (home: $TARGET_HOME) ---"
+
+  say "2/6  Backup of existing configs [$TARGET_USER]"
+  if [[ "$NO_BACKUP" -eq 1 ]]; then
+    warn "backup skipped by --no-backup"
+  else
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+      printf '   [dry-run] mkdir -p %s\n' "$BACKUP_DIR"
+      for d in "${ALL_CONFIG_DIRS[@]}"; do
+        printf '   [dry-run] cp -a %s -> %s/%s (if exists)\n' "$d" "$BACKUP_DIR" "$(backup_label "$d")"
+      done
+    else
+      mkdir -p "$BACKUP_DIR"
+      copied=0
+      for d in "${ALL_CONFIG_DIRS[@]}"; do
+        if [[ -e "$d" ]]; then
+          cp -a -- "$d" "$BACKUP_DIR/$(backup_label "$d")"
+          echo "   saved: $d -> $BACKUP_DIR/$(backup_label "$d")"
+          copied=1
+        fi
+      done
+      # mkdir/cp ran as root when invoked via sudo — hand the backup back to its owner.
+      if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
+        chown -R -- "$TARGET_USER" "$BACKUP_DIR" || warn "could not chown $BACKUP_DIR to $TARGET_USER"
+      fi
+      [[ "$copied" -eq 1 ]] && ok "backup at $BACKUP_DIR" || echo "   (no existing configs — nothing to back up)"
+    fi
+  fi
+
+  say "3/6  Wiping configs to factory-fresh state [$TARGET_USER]"
+  for d in "${ALL_CONFIG_DIRS[@]}"; do
+    safe_rm "$d"
+  done
+  ok "configs are factory-fresh [$TARGET_USER]"
+}
+
+for entry in "${USER_LIST[@]}"; do
+  reset_one_user "${entry%%:*}" "${entry#*:}"
 done
-ok "configs are factory-fresh"
 
 # ---------- 4/6 ensure official apt repos (idempotent) ----------
 say "4/6  Ensuring official VS Code + Sublime apt repos"
@@ -272,7 +336,8 @@ ensure_vscode_repo() {
   else
     wget -qO- https://packages.microsoft.com/keys/microsoft.asc \
       | gpg --dearmor \
-      | $SUDO tee /etc/apt/keyrings/ms-vscode.gpg >/dev/null
+      | $SUDO tee /etc/apt/keyrings/ms-vscode.gpg >/dev/null \
+      || die "Failed to fetch the VS Code key (network down? packages.microsoft.com reachable?). Re-run to retry."
     $SUDO chmod 644 /etc/apt/keyrings/ms-vscode.gpg
     # shellcheck disable=SC2046
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/ms-vscode.gpg] https://packages.microsoft.com/repos/code stable main" \
@@ -291,7 +356,8 @@ ensure_sublime_repo() {
   else
     wget -qO- https://download.sublimetext.com/sublimehq-pub.gpg \
       | gpg --dearmor \
-      | $SUDO tee /etc/apt/trusted.gpg.d/sublimehq-archive.gpg >/dev/null
+      | $SUDO tee /etc/apt/trusted.gpg.d/sublimehq-archive.gpg >/dev/null \
+      || die "Failed to fetch the Sublime key (network down? download.sublimetext.com reachable?). Re-run to retry."
     $SUDO chmod 644 /etc/apt/trusted.gpg.d/sublimehq-archive.gpg
     echo "deb https://download.sublimetext.com/ apt/stable/" \
       | $SUDO tee /etc/apt/sources.list.d/sublime-text.list >/dev/null
@@ -330,25 +396,31 @@ fi
 ok "latest tools installed"
 
 # ---------- 6/6 verify ----------
+# Freshness note: `code --version` / `subl --version` were sandbox-tested to
+# create NOTHING under $HOME, so they are safe to run post-wipe. The
+# `codeblocks` GUI binary is deliberately NEVER launched here (first launch
+# must generate its own default.conf) — dpkg + PATH presence is the check.
 say "6/6  Verifying (binaries + real C++17 compile)"
 FAIL=0
+check_ver() {  # check_ver LABEL CMD... — requires non-empty version output
+  local label="$1"; shift
+  local ver=""
+  ver="$("$@" 2>/dev/null | head -n1)" || ver=""
+  if [[ -n "$ver" ]]; then ok "$label: $ver";
+  else warn "$label missing or broken"; FAIL=1; fi
+}
 if [[ "$DRY_RUN" -eq 1 ]]; then
   echo "   [dry-run] gcc --version; g++ --version; code --version; subl --version; dpkg-query codeblocks; compile hello-world"
 else
-  if gcc --version >/dev/null 2>&1; then ok "gcc          : $(gcc --version | head -n1)";
-  else warn "gcc missing"; FAIL=1; fi
-
-  if g++ --version >/dev/null 2>&1; then ok "g++          : $(g++ --version | head -n1)";
-  else warn "g++ missing"; FAIL=1; fi
-
-  if command -v code >/dev/null 2>&1; then ok "VS Code      : $(code --version 2>/dev/null | head -n1)";
+  check_ver "gcc          " gcc --version
+  check_ver "g++          " g++ --version
+  if command -v code >/dev/null 2>&1; then check_ver "VS Code      " code --version;
   else warn "VS Code (code) missing"; FAIL=1; fi
-
-  if command -v subl >/dev/null 2>&1; then ok "Sublime      : $(subl --version 2>/dev/null)";
+  if command -v subl >/dev/null 2>&1; then check_ver "Sublime      " subl --version;
   else warn "Sublime (subl) missing"; FAIL=1; fi
-
   if dpkg-query -W codeblocks >/dev/null 2>&1; then ok "Code::Blocks : $(dpkg-query -W -f='${Version}' codeblocks)";
   else warn "Code::Blocks missing"; FAIL=1; fi
+  command -v codeblocks >/dev/null 2>&1 || { warn "Code::Blocks (codeblocks) not on PATH"; FAIL=1; }
 
   # Real compile test — proves the toolchain (not just the package entry) works.
   TMPD="$(mktemp -d)"
@@ -371,6 +443,11 @@ fi
 
 printf '\033[1;32mReset complete.\033[0m IDEs are factory-fresh + latest.\n'
 echo "Launch with:  code | subl | codeblocks     Compile with:  g++ -std=c++17 -O2 file.cpp -o file"
+echo "First open of each IDE will look brand-new (welcome screens, no extensions, no old projects)."
 if [[ "$NO_BACKUP" -eq 0 && "$DRY_RUN" -eq 0 ]]; then
-  echo "Old settings backed up at: $BACKUP_DIR  (delete it once the lab PC looks right)"
+  for entry in "${USER_LIST[@]}"; do
+    set_target "${entry%%:*}" "${entry#*:}"
+    echo "Old settings for $TARGET_USER backed up at: $BACKUP_DIR"
+  done
+  echo "(delete those backup dirs once the lab PC looks right)"
 fi
