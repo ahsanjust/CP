@@ -8,11 +8,16 @@
 #   What it does, in order:
 #     1. Kills running IDE processes (code, subl/sublime_text, codeblocks)
 #     2. Backs up existing configs to ~/cp-ide-backup-<timestamp>/ (skip with --no-backup)
-#     3. Wipes configs to factory-fresh (VS Code, Sublime, Code::Blocks + extensions/settings)
-#     4. Ensures official apt repos exist (VS Code Microsoft, Sublime HQ) — idempotent,
+#        (each config gets a UNIQUE backup name — no overwrites; dir chowned to the real user)
+#     3. Wipes IDE configs to factory-fresh (VS Code, Sublime, Code::Blocks + extensions/settings)
+#        NOTE: the g++/gcc toolchain has no user configs — it is NEVER wiped,
+#        only ensured present + upgraded to latest (build-essential + gdb).
+#     4. Installs repo prerequisites, then ensures official apt repos exist
+#        (VS Code Microsoft, Sublime HQ) — idempotent,
 #        handles both legacy .list and modern DEB822 .sources formats
 #     5. apt update + installs/upgrades everything to latest
-#     6. Verifies binaries + does a real g++ -std=c++17 hello-world compile test
+#     6. Verifies binaries (gcc, g++, code, subl, codeblocks)
+#        + does a real g++ -std=c++17 hello-world compile test
 #
 #   One-liner (lab PCs):
 #     curl -fsSL https://raw.githubusercontent.com/ahsanjust/CP/main/reset-all/reset.sh | bash
@@ -103,6 +108,8 @@ BACKUP_DIR="$TARGET_HOME/cp-ide-backup-$(date +%Y%m%d-%H%M%S)"
 
 # ---------- config paths (factory-reset targets) ----------
 # NOTE: kept as an explicit list so nothing unrelated is ever touched.
+# IMPORTANT: the g++/gcc toolchain has NO entries here on purpose — compilers
+# have no per-user IDE-style configs to wipe; they are only (re)installed.
 VSCODE_DIRS=(
   "$TARGET_HOME/.config/Code"
   "$TARGET_HOME/.vscode"
@@ -120,11 +127,28 @@ CODEBLOCKS_DIRS=(
 )
 ALL_CONFIG_DIRS=("${VSCODE_DIRS[@]}" "${SUBLIME_DIRS[@]}" "${CODEBLOCKS_DIRS[@]}")
 
+# Unique backup names — two sources share a basename (sublime-text x2,
+# codeblocks x2), so a plain `cp ... BACKUP/` would silently overwrite.
+backup_label() {
+  case "$1" in
+    "$TARGET_HOME/.config/Code")            printf 'config-Code' ;;
+    "$TARGET_HOME/.vscode")                 printf 'vscode' ;;
+    "$TARGET_HOME/snap/code")               printf 'snap-code' ;;
+    "$TARGET_HOME/.config/sublime-text")    printf 'config-sublime-text' ;;
+    "$TARGET_HOME/.config/sublime-text-3")  printf 'config-sublime-text-3' ;;
+    "$TARGET_HOME/.cache/sublime-text")     printf 'cache-sublime-text' ;;
+    "$TARGET_HOME/.config/codeblocks")      printf 'config-codeblocks' ;;
+    "$TARGET_HOME/.codeblocks")             printf 'home-codeblocks' ;;
+    "$TARGET_HOME/.local/share/codeblocks") printf 'local-share-codeblocks' ;;
+    *) basename -- "$1" ;;
+  esac
+}
+
 say "This will RESET to factory-fresh + latest:"
 echo "  • VS Code      : ${VSCODE_DIRS[*]}"
 echo "  • Sublime Text : ${SUBLIME_DIRS[*]}"
 echo "  • Code::Blocks : ${CODEBLOCKS_DIRS[*]}"
-echo "  • Packages     : build-essential gdb codeblocks code sublime-text"
+echo "  • Packages     : build-essential (gcc + g++) gdb codeblocks code sublime-text"
 if [[ "$NO_BACKUP" -eq 0 ]]; then
   echo "  • Backup       : $BACKUP_DIR"
 else
@@ -173,18 +197,22 @@ else
   if [[ "$DRY_RUN" -eq 1 ]]; then
     printf '   [dry-run] mkdir -p %s\n' "$BACKUP_DIR"
     for d in "${ALL_CONFIG_DIRS[@]}"; do
-      printf '   [dry-run] cp -a %s -> %s/ (if exists)\n' "$d" "$BACKUP_DIR"
+      printf '   [dry-run] cp -a %s -> %s/%s (if exists)\n' "$d" "$BACKUP_DIR" "$(backup_label "$d")"
     done
   else
     mkdir -p "$BACKUP_DIR"
     copied=0
     for d in "${ALL_CONFIG_DIRS[@]}"; do
       if [[ -e "$d" ]]; then
-        cp -a -- "$d" "$BACKUP_DIR"/
-        echo "   saved: $d"
+        cp -a -- "$d" "$BACKUP_DIR/$(backup_label "$d")"
+        echo "   saved: $d -> $BACKUP_DIR/$(backup_label "$d")"
         copied=1
       fi
     done
+    # mkdir/cp ran as root when invoked via sudo — hand the backup back to the real user.
+    if [[ "$(id -u)" -eq 0 && "$TARGET_USER" != "root" ]]; then
+      chown -R -- "$TARGET_USER" "$BACKUP_DIR" || warn "could not chown $BACKUP_DIR to $TARGET_USER"
+    fi
     [[ "$copied" -eq 1 ]] && ok "backup at $BACKUP_DIR" || echo "   (no existing configs — nothing to back up)"
   fi
 fi
@@ -221,6 +249,15 @@ ok "configs are factory-fresh"
 
 # ---------- 4/6 ensure official apt repos (idempotent) ----------
 say "4/6  Ensuring official VS Code + Sublime apt repos"
+
+# Bootstrap FIRST: repo keys below need wget/gpg, which minimal systems may lack.
+if [[ "$DRY_RUN" -eq 1 ]]; then
+  echo "   [dry-run] apt-get update -y"
+  echo "   [dry-run] apt-get install -y wget gpg ca-certificates apt-transport-https"
+else
+  run_root apt-get update -y
+  run_root apt-get install -y wget gpg ca-certificates apt-transport-https
+fi
 
 ensure_vscode_repo() {
   # Already configured? (covers .list, .sources, and the microsoft-prod key layout)
@@ -268,14 +305,13 @@ ok "repos ensured"
 # ---------- 5/6 update + install latest ----------
 say "5/6  Updating package index + installing latest tools"
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "   [dry-run] apt-get update -y"
-  echo "   [dry-run] apt-get install -y build-essential gdb wget gpg ca-certificates apt-transport-https"
+  echo "   [dry-run] apt-get update -y  (repos changed above)"
+  echo "   [dry-run] apt-get install -y build-essential gdb"
   echo "   [dry-run] apt-get install -y codeblocks"
   echo "   [dry-run] apt-get install -y code || snap fallback"
   echo "   [dry-run] apt-get install -y sublime-text"
 else
   run_root apt-get update -y
-  run_root apt-get install -y wget gpg ca-certificates apt-transport-https
   run_root apt-get install -y build-essential gdb
   run_root apt-get install -y codeblocks
 
@@ -297,8 +333,11 @@ ok "latest tools installed"
 say "6/6  Verifying (binaries + real C++17 compile)"
 FAIL=0
 if [[ "$DRY_RUN" -eq 1 ]]; then
-  echo "   [dry-run] g++ --version; code --version; subl --version; dpkg-query codeblocks; compile hello-world"
+  echo "   [dry-run] gcc --version; g++ --version; code --version; subl --version; dpkg-query codeblocks; compile hello-world"
 else
+  if gcc --version >/dev/null 2>&1; then ok "gcc          : $(gcc --version | head -n1)";
+  else warn "gcc missing"; FAIL=1; fi
+
   if g++ --version >/dev/null 2>&1; then ok "g++          : $(g++ --version | head -n1)";
   else warn "g++ missing"; FAIL=1; fi
 
